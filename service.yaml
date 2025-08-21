@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: icrc-missing-persons-dashboard
+  labels:
+    app: icrc-dashboard
+    app.kubernetes.io/component: web
+    app.kubernetes.io/instance: icrc-dashboard
+    app.kubernetes.io/name: icrc-missing-persons
+    app.kubernetes.io/part-of: icrc-application
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8501
+    protocol: TCP
+    targetPort: 8501
+  selector:
+    app: icrc-dashboard
