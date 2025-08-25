@@ -5,6 +5,16 @@ from datetime import datetime
 import io
 import trino.dbapi
 import os
+import uuid
+from typing import List
+
+# RAG imports (optional - graceful degradation if not available)
+try:
+    from llama_stack_client import LlamaStackClient, RAGDocument
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    st.warning("RAG functionality not available. Install llama-stack-client to enable chat features.")
 
 st.set_page_config(
     page_title="ICRC Missing Persons Dashboard",
@@ -17,9 +27,23 @@ st.title("🔍 ICRC Missing Persons Field Report Dashboard")
 @st.cache_data
 def load_data(file):
     """Load and process the CSV data"""
-    df = pd.read_csv(file)
-    df['Update Date'] = pd.to_datetime(df['Update Date'])
-    return df
+    try:
+        # Try reading with error handling for malformed lines
+        df = pd.read_csv(file, on_bad_lines='skip', engine='python')
+        
+        # Try to find and convert date columns
+        for col in df.columns:
+            if 'date' in col.lower() or 'time' in col.lower():
+                try:
+                    df[col] = pd.to_datetime(df[col])
+                except:
+                    continue
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error reading CSV file: {str(e)}")
+        return pd.DataFrame()  # Return empty DataFrame instead of failing
 
 @st.cache_data
 def get_starburst_tables():
@@ -172,7 +196,7 @@ def main():
     st.sidebar.write(list(df.columns))
     
     # Main content tabs
-    tab1, tab2, tab3 = st.tabs(["📈 Latest Updates", "🔍 Search & History", "📊 Analytics"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Latest Updates", "🔍 Search & History", "📊 Analytics", "💬 Chat with Data"])
     
     with tab1:
         st.header("Latest Updates")
@@ -289,12 +313,20 @@ def main():
                 if len(categorical_cols) > 0:
                     cat_col = categorical_cols[0]
                     counts = df[cat_col].value_counts().head(10)
+                    
+                    # Create DataFrame for plotly to avoid list/array issues
+                    chart_df = pd.DataFrame({
+                        'Category': counts.index,
+                        'Count': counts.values
+                    })
+                    
                     fig_cat = px.bar(
-                        x=counts.values,
-                        y=counts.index,
+                        chart_df,
+                        x='Count',
+                        y='Category',
                         orientation='h',
                         title=f"Top 10 {cat_col} Counts",
-                        labels={'x': 'Count', 'y': cat_col}
+                        labels={'Count': 'Count', 'Category': cat_col}
                     )
                     fig_cat.update_layout(height=400)
                     st.plotly_chart(fig_cat, use_container_width=True)
@@ -306,11 +338,19 @@ def main():
                     df_time = df.copy()
                     df_time['Period'] = df_time[date_col].dt.to_period('M')
                     time_counts = df_time.groupby('Period').size()
+                    
+                    # Create DataFrame for plotly
+                    time_chart_df = pd.DataFrame({
+                        'Month': time_counts.index.astype(str),
+                        'Count': time_counts.values
+                    })
+                    
                     fig_time = px.bar(
-                        x=time_counts.index.astype(str),
-                        y=time_counts.values,
+                        time_chart_df,
+                        x='Month',
+                        y='Count',
                         title=f"Records by Month ({date_col})",
-                        labels={'x': 'Month', 'y': 'Count'}
+                        labels={'Month': 'Month', 'Count': 'Count'}
                     )
                     fig_time.update_layout(height=400)
                     st.plotly_chart(fig_time, use_container_width=True)
@@ -349,6 +389,190 @@ def main():
         if numeric_cols:
             st.subheader("Numeric Statistics")
             st.dataframe(df[numeric_cols].describe(), use_container_width=True)
+    
+    with tab4:
+        setup_chat_interface(df)
+
+# === RAG FUNCTIONALITY ===
+
+def create_rag_documents(df: pd.DataFrame) -> List:
+    """Convert DataFrame to RAG documents"""
+    if not RAG_AVAILABLE:
+        return []
+    
+    documents = []
+    
+    # Group by claim/case ID if available
+    id_col = None
+    for col in df.columns:
+        if 'id' in col.lower() or 'claim' in col.lower():
+            id_col = col
+            break
+    
+    if id_col and df[id_col].nunique() < len(df):
+        # Multiple rows per ID - group them
+        for case_id in df[id_col].unique():
+            case_data = df[df[id_col] == case_id]
+            content = f"Case ID: {case_id}\n\n"
+            
+            for _, row in case_data.iterrows():
+                row_text = "\n".join([f"{col}: {val}" for col, val in row.items()])
+                content += f"{row_text}\n\n---\n\n"
+            
+            documents.append(RAGDocument(
+                document_id=str(case_id),
+                content=content,
+                metadata={"case_id": str(case_id)}
+            ))
+    else:
+        # One document per row
+        for idx, row in df.iterrows():
+            content = "\n".join([f"{col}: {val}" for col, val in row.items()])
+            documents.append(RAGDocument(
+                document_id=f"row_{idx}",
+                content=content,
+                metadata={"row_index": idx}
+            ))
+    
+    return documents
+
+def setup_rag_system(documents: List) -> tuple:
+    """Initialize RAG system - returns (client, vector_db_id)"""
+    if not RAG_AVAILABLE or not documents:
+        return None, None
+    
+    try:
+        base_url = os.getenv("LLAMA_STACK_BASE_URL", "https://llamastack-genaiops-rag.apps.dev.rhoai.rh-aiservices-bu.com/")
+        client = LlamaStackClient(base_url=base_url)
+        vector_db_id = f"icrc_data_{uuid.uuid4().hex[:8]}"
+        
+        # Try to register vector DB and insert documents
+        try:
+            client.vector_dbs.register(
+                vector_db_id=vector_db_id,
+                embedding_model="all-MiniLM-L6-v2",
+                embedding_dimension=384,
+                provider_id="milvus"
+            )
+        except:
+            pass  # May already exist or different provider needed
+        
+        # Insert documents
+        client.tool_runtime.rag_tool.insert(
+            documents=documents,
+            vector_db_id=vector_db_id,
+            chunk_size_in_tokens=512
+        )
+        
+        return client, vector_db_id
+        
+    except Exception as e:
+        st.error(f"RAG setup failed: {e}")
+        return None, None
+
+def query_rag(client, vector_db_id: str, query: str) -> str:
+    """Query RAG system"""
+    if not client:
+        return "RAG system not available"
+    
+    try:
+        # Retrieve documents
+        rag_response = client.tool_runtime.rag_tool.query(
+            content=query,
+            vector_db_ids=[vector_db_id]
+        )
+        
+        # Generate response
+        messages = [
+            {"role": "system", "content": f"You are a helpful assistant analyzing data. Use this context: {rag_response}"},
+            {"role": "user", "content": query}
+        ]
+        
+        response = client.inference.chat_completion(
+            messages=messages,
+            model_id=os.getenv("RAG_MODEL_ID", "llama32"),
+            sampling_params={"temperature": 0.7, "max_tokens": 1000},
+            stream=False
+        )
+        
+        return response.completion_message.content
+        
+    except Exception as e:
+        return f"Query failed: {e}"
+
+def setup_chat_interface(df: pd.DataFrame):
+    """Setup chat interface for the current data"""
+    st.header("💬 Chat with Your Data")
+    
+    if not RAG_AVAILABLE:
+        st.error("🚫 RAG functionality not available. Please install llama-stack-client.")
+        return
+    
+    if df is None or df.empty:
+        st.info("📋 Please load data first to enable chat functionality.")
+        return
+    
+    # Step 1: Ask user to confirm setup
+    if "rag_setup_done" not in st.session_state:
+        st.subheader("🔧 Setup Required")
+        st.info(f"📄 Ready to process {len(df)} rows of data for chat.")
+        
+        if st.button("🚀 Setup Chat with This Data", type="primary"):
+            with st.spinner("🔄 Setting up RAG system..."):
+                documents = create_rag_documents(df)
+                if documents:
+                    client, vector_db_id = setup_rag_system(documents)
+                    if client:
+                        st.session_state.rag_client = client
+                        st.session_state.vector_db_id = vector_db_id
+                        st.session_state.rag_setup_done = True
+                        st.success("✅ Chat setup complete!")
+                        st.rerun()
+                    else:
+                        st.error("❌ RAG setup failed")
+                else:
+                    st.error("❌ No documents created")
+        return
+    
+    # Step 2: Chat interface
+    st.subheader("💬 Chat Interface")
+    
+    # Initialize chat history
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Display chat history
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("💬 Ask about your data..."):
+        # Add user message
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("🔍 Searching data..."):
+                response = query_rag(
+                    st.session_state.get("rag_client"),
+                    st.session_state.get("vector_db_id"),
+                    prompt
+                )
+            st.write(response)
+        
+        # Add assistant response
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+    
+    # Reset button
+    if st.button("🔄 Reset Chat"):
+        for key in ["chat_history", "rag_setup_done", "rag_client", "vector_db_id"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
 
 if __name__ == "__main__":
     main()
