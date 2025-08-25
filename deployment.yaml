@@ -57,6 +57,8 @@ spec:
           value: "true"
         - name: STREAMLIT_SERVER_FILE_WATCHER_TYPE
           value: "none"
+        - name: STARBURST_HOST
+          value: "starburst-fabricdemo.apps.cluster-v42lf.v42lf.sandbox239.opentlc.com"
         securityContext:
           allowPrivilegeEscalation: false
           runAsNonRoot: true
