@@ -470,10 +470,11 @@ def setup_rag_system(documents: List) -> tuple:
         st.error(f"RAG setup failed: {e}")
         return None, None
 
-def query_rag(client, vector_db_id: str, query: str) -> str:
-    """Query RAG system"""
+def query_rag_streaming(client, vector_db_id: str, query: str):
+    """Query RAG system with streaming response"""
     if not client:
-        return "RAG system not available"
+        yield "RAG system not available"
+        return
     
     try:
         # Retrieve documents
@@ -482,7 +483,7 @@ def query_rag(client, vector_db_id: str, query: str) -> str:
             vector_db_ids=[vector_db_id]
         )
         
-        # Generate response
+        # Generate streaming response
         messages = [
             {"role": "system", "content": f"You are a helpful assistant analyzing data. Use this context: {rag_response}"},
             {"role": "user", "content": query}
@@ -492,13 +493,23 @@ def query_rag(client, vector_db_id: str, query: str) -> str:
             messages=messages,
             model_id=os.getenv("RAG_MODEL_ID", "llama32"),
             sampling_params={"temperature": 0.7, "max_tokens": 1000},
-            stream=False
+            stream=True
         )
         
-        return response.completion_message.content
+        # Process streaming response
+        for chunk in response:
+            try:
+                response_delta = chunk.event.delta
+                if hasattr(response_delta, 'text') and response_delta.text:
+                    yield response_delta.text
+                elif hasattr(response_delta, 'content') and response_delta.content:
+                    yield response_delta.content
+            except Exception as chunk_error:
+                # Handle individual chunk errors gracefully
+                continue
         
     except Exception as e:
-        return f"Query failed: {e}"
+        yield f"Query failed: {e}"
 
 def setup_chat_interface(df: pd.DataFrame):
     """Setup chat interface for the current data"""
@@ -554,18 +565,25 @@ def setup_chat_interface(df: pd.DataFrame):
         with st.chat_message("user"):
             st.write(prompt)
         
-        # Generate response
+        # Generate streaming response
         with st.chat_message("assistant"):
-            with st.spinner("🔍 Searching data..."):
-                response = query_rag(
-                    st.session_state.get("rag_client"),
-                    st.session_state.get("vector_db_id"),
-                    prompt
-                )
-            st.write(response)
+            response_placeholder = st.empty()
+            full_response = ""
+            
+            # Stream the response
+            for chunk in query_rag_streaming(
+                st.session_state.get("rag_client"),
+                st.session_state.get("vector_db_id"),
+                prompt
+            ):
+                full_response += chunk
+                response_placeholder.write(full_response + "▋")  # Add cursor effect
+            
+            # Remove cursor and show final response
+            response_placeholder.write(full_response)
         
-        # Add assistant response
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
+        # Add assistant response to history
+        st.session_state.chat_history.append({"role": "assistant", "content": full_response})
     
     # Reset button
     if st.button("🔄 Reset Chat"):
