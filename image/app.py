@@ -130,7 +130,13 @@ def main():
         help="Select whether to upload a CSV file or connect to Starburst database"
     )
     
-    df = None
+    # Initialize session state for data persistence
+    if 'loaded_data' not in st.session_state:
+        st.session_state.loaded_data = None
+    if 'data_source_type' not in st.session_state:
+        st.session_state.data_source_type = None
+    
+    df = st.session_state.loaded_data
     
     if data_source == "CSV Upload":
         # File upload section
@@ -141,9 +147,26 @@ def main():
         )
         
         if uploaded_file is not None:
-            df = load_data(uploaded_file)
-            st.sidebar.success("✅ Custom CSV loaded successfully!")
+            # Only reload if it's a different file or no data is cached
+            if (st.session_state.loaded_data is None or 
+                st.session_state.data_source_type != 'csv' or 
+                'uploaded_file_name' not in st.session_state or 
+                st.session_state.uploaded_file_name != uploaded_file.name):
+                
+                df = load_data(uploaded_file)
+                st.session_state.loaded_data = df
+                st.session_state.data_source_type = 'csv'
+                st.session_state.uploaded_file_name = uploaded_file.name
+                st.sidebar.success("✅ Custom CSV loaded successfully!")
+            else:
+                df = st.session_state.loaded_data
+                st.sidebar.success("✅ Custom CSV loaded successfully!")
         else:
+            if st.session_state.data_source_type == 'csv':
+                # Clear cached data if no file is uploaded
+                st.session_state.loaded_data = None
+                st.session_state.data_source_type = None
+                df = None
             st.error("Please upload a CSV file to continue.")
             return
     
@@ -173,11 +196,19 @@ def main():
                     with st.spinner(f"Loading data from {selected_table}..."):
                         df = load_starburst_table(selected_table)
                         if df is not None:
+                            # Store in session state for persistence
+                            st.session_state.loaded_data = df
+                            st.session_state.data_source_type = 'starburst'
+                            st.session_state.selected_table = selected_table
                             st.sidebar.success(f"✅ Loaded {len(df)} records from {selected_table}")
                         else:
                             st.sidebar.error("❌ Failed to load table data")
+                elif 'selected_table' in st.session_state and st.session_state.selected_table == selected_table and st.session_state.loaded_data is not None:
+                    # Data already loaded for this table
+                    df = st.session_state.loaded_data
+                    st.sidebar.success(f"✅ Using cached data: {len(df)} records from {selected_table}")
     
-    if df is None:
+    if df is None or df.empty:
         st.info("Please select and load a data source to continue.")
         return
     
@@ -244,13 +275,13 @@ def main():
                 # First search column
                 search_col1 = search_columns[0]
                 values1 = ['All'] + sorted(df[search_col1].dropna().unique().tolist())
-                selected_value1 = st.selectbox(f"Search by {search_col1}", values1, key="search1")
+                selected_value1 = st.selectbox(f"Search by {search_col1}", values1, key=f"search1_{search_col1}")
             
             with col2:
                 # Second search column
                 search_col2 = search_columns[1] if len(search_columns) > 1 else search_columns[0]
                 values2 = ['All'] + sorted(df[search_col2].dropna().unique().tolist())
-                selected_value2 = st.selectbox(f"Search by {search_col2}", values2, key="search2")
+                selected_value2 = st.selectbox(f"Search by {search_col2}", values2, key=f"search2_{search_col2}")
             
             # Filter data based on selections
             filtered_df = df.copy()
@@ -523,12 +554,27 @@ def setup_chat_interface(df: pd.DataFrame):
         st.info("📋 Please load data first to enable chat functionality.")
         return
     
+    # Check if RAG setup is valid for current data
+    data_source = getattr(st.session_state, 'data_source_type', 'unknown')
+    table_name = getattr(st.session_state, 'selected_table', 'csv_upload')
+    data_id = f"{data_source}_{table_name}_{len(df)}"
+    
+    if 'rag_data_id' not in st.session_state:
+        st.session_state.rag_data_id = None
+    
+    # Debug info (remove this after fixing)
+    setup_done = st.session_state.get("rag_setup_done", False)
+    current_data_id = st.session_state.get("rag_data_id", "none")
+    
     # Step 1: Ask user to confirm setup
-    if "rag_setup_done" not in st.session_state:
+    if (not setup_done or current_data_id != data_id):
+        
         st.subheader("🔧 Setup Required")
         st.info(f"📄 Ready to process {len(df)} rows of data for chat.")
+        # Debug info
+        st.write(f"Debug: setup_done={setup_done}, current_data_id={current_data_id}, new_data_id={data_id}")
         
-        if st.button("🚀 Setup Chat with This Data", type="primary"):
+        if st.button("🚀 Setup Chat with This Data", type="primary", key="setup_rag"):
             with st.spinner("🔄 Setting up RAG system..."):
                 documents = create_rag_documents(df)
                 if documents:
@@ -537,13 +583,17 @@ def setup_chat_interface(df: pd.DataFrame):
                         st.session_state.rag_client = client
                         st.session_state.vector_db_id = vector_db_id
                         st.session_state.rag_setup_done = True
+                        st.session_state.rag_data_id = data_id
                         st.success("✅ Chat setup complete!")
-                        st.rerun()
+                        # Don't use st.rerun() - let it fall through to show chat interface
                     else:
                         st.error("❌ RAG setup failed")
+                        return
                 else:
                     st.error("❌ No documents created")
-        return
+                    return
+        else:
+            return
     
     # Step 2: Chat interface
     st.subheader("💬 Chat Interface")
@@ -586,8 +636,8 @@ def setup_chat_interface(df: pd.DataFrame):
         st.session_state.chat_history.append({"role": "assistant", "content": full_response})
     
     # Reset button
-    if st.button("🔄 Reset Chat"):
-        for key in ["chat_history", "rag_setup_done", "rag_client", "vector_db_id"]:
+    if st.button("🔄 Reset Chat", key="reset_chat"):
+        for key in ["chat_history", "rag_setup_done", "rag_client", "vector_db_id", "rag_data_id"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
