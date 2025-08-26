@@ -562,7 +562,7 @@ def setup_chat_interface(df: pd.DataFrame):
     if 'rag_data_id' not in st.session_state:
         st.session_state.rag_data_id = None
     
-    # Debug info (remove this after fixing)
+    # Check if setup is needed
     setup_done = st.session_state.get("rag_setup_done", False)
     current_data_id = st.session_state.get("rag_data_id", "none")
     
@@ -571,8 +571,6 @@ def setup_chat_interface(df: pd.DataFrame):
         
         st.subheader("🔧 Setup Required")
         st.info(f"📄 Ready to process {len(df)} rows of data for chat.")
-        # Debug info
-        st.write(f"Debug: setup_done={setup_done}, current_data_id={current_data_id}, new_data_id={data_id}")
         
         if st.button("🚀 Setup Chat with This Data", type="primary", key="setup_rag"):
             with st.spinner("🔄 Setting up RAG system..."):
@@ -585,7 +583,7 @@ def setup_chat_interface(df: pd.DataFrame):
                         st.session_state.rag_setup_done = True
                         st.session_state.rag_data_id = data_id
                         st.success("✅ Chat setup complete!")
-                        # Don't use st.rerun() - let it fall through to show chat interface
+                        st.rerun()  # Rerun to clear the setup UI and show chat interface
                     else:
                         st.error("❌ RAG setup failed")
                         return
